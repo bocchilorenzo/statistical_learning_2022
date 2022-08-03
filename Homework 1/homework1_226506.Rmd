@@ -1,0 +1,269 @@
+---
+title: "Homework 1"
+author: "Lorenzo Bocchi"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document:
+    df_print: paged
+  word_document: default
+geometry: left=1.5cm,right=1.5cm,top=1.5cm,bottom=1.5cm
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE,
+                      message=FALSE,
+                      tidy.opts=list(width.cutoff = 80),
+                      tidy = TRUE)
+library(tidyverse)
+library(tidymodels)
+library(caret)
+library(pROC)
+```
+
+The aim of the following analysis is to understand which factors mostly affect the decision of pregnant women to breastfeed their babies. The data comes from a study conducted in the UK. In total, 139 mothers were asked what kind of feeding method they would choose for their incoming baby. Throughout the analysis we will see different prediction models and compare their results.
+We start by loading the data and exploring it:
+```{r}
+load("./breastfeed.Rdata")
+```
+
+```{r}
+bf <- breastfeed
+summary(bf)
+```
+
+The factors that could influence the decision are multiple:
+
+- the advancement of the pregnancy (pregnancy)
+
+- how the mothers were fed as babies (howfed)
+
+- how the mother’s friend fed their babies (howfedfr)
+
+- if they have a partner (partner)
+
+- their age (age)
+
+- the age at which they left full-time education (educat)
+
+- their ethnicity (ethnic)
+
+- if they have ever smoked (smokebf)
+
+- if they have stopped smoking (smokenow)
+
+We can visualize the comparison of bottle vs breastfeeding:
+```{r}
+plot(bf$breast)
+```
+
+As we can see, in general the majority of women prefer breastfeeding (100) over bottlefeeding (39). We now check for any missing values:
+```{r}
+any(is.na(bf))
+```
+Having NA values might be a problem for the outcome, but removing them could distort it. Therefore, we try to substitute all NA values with the mean of the column instead:
+```{r}
+for(i in 1:ncol(bf)) {
+  bf[ , i][is.na(bf[ , i])] <- mean(bf[ , i], na.rm = TRUE)
+}
+any(is.na(bf))
+```
+
+```{r}
+summary(bf)
+```
+
+The values remained unchanged, but now we don't have any NA value in the dataset.
+
+We now split the data in the reproducible training and testing sets. The training data will contain 80% of the samples. To create the sample, we use caret's createDataPartition, which allows us to specify the percentage of the training data and automatically generates a random list of numbers, corresponding to the indexes of the data to use in the training set. We also set a cross validation control for our future computations:
+```{r}
+set.seed(1)
+sample <- caret::createDataPartition(bf$breast, p=0.8)
+train_data <- bf[sample$Resample1, ]
+test_data <- bf[-sample$Resample1, ]
+ctrl <- trainControl(method="cv")
+```
+
+The first model to be fit is the GLM model
+\begin{align*}
+logit(E(breast)) = β0 + β1pregnancy + β2howfed + β3howfedfr \\ + β4partner + β5age + β6educat + β7ethnic + β8smokenow + β9smokebf
+\end{align*}
+To do this, we use caret's train function, which takes in input not only the function and the data, but also the method for the model (in this case "glm") and the training control. This latter parameter allows us to use the previously set cross validation:
+```{r}
+glmFit <- train(breast ~ .,
+                data = train_data,
+                method = "glm",
+                trControl = ctrl)
+summary(glmFit)
+```
+
+By looking at the coefficients, we can see that the most significant one seems to be "howfedfr" for the value "Breast". This means that the way that a mother's friend feeds their baby seems to have the most influence on how she will feed hers. The other two coefficients that seem to have some significance, although lower, are "smokenow" for the value "Yes" and "ethnic" for the value "Non-white".
+
+We can make the predictions for the test data and visualize both the confusion matrix and the accuracy of the model:
+```{r}
+glm.probs <- predict(glmFit, test_data, type="prob")
+
+glm.pred <- rep("Bottle", nrow(test_data))
+glm.pred[glm.probs[,2] > 0.5] <- "Breast"
+
+table(glm.pred, test_data$breast)
+(accGlm <- mean(glm.pred == test_data$breast))
+```
+
+The accuracy for this model is ~77.8%.
+
+Now we try to fit a k-nn classifier. For this, we will do a nested cross validation instead of a regular cross validation. We start by dividing our training data in multiple partitions to test. Since we don't have lots of observations available, we will use 5 folds for the outer layer:
+```{r}
+set.seed(1)
+trainK <- train_data
+folds <- list()
+nfolds <- 5
+sampleLen <- round((nrow(trainK)/nfolds)) #here we round to the nearest lower integer
+for (n in c(1:nfolds)) {
+  sample <- sample.int(nrow(trainK), sampleLen, replace = FALSE)
+  folds[paste0("fold", n)] <- list(trainK[sample, ])
+  trainK <- trainK[-sample,]
+}
+#in this case we leave out one observation to keep the folds balanced
+```
+
+Then, we proceed following these steps:
+
+- train a model for each fold with a k that varies between 1 and 14 (maximum limit of the train function)
+
+- find out the mean accuracy of each k between each model
+
+- choose the k based on this 
+```{r}
+set.seed(1)
+foldFits <- list()
+i <- 1
+kLim <- 14 #setting the maximum k
+#training a model on each fold for all the ks
+for (fold in folds){
+  tmp <- train(breast ~ .,
+               data = fold,
+               method = "knn",
+               trControl = trainControl(method="cv", number = 3),
+               tuneGrid = expand.grid(k = 1:kLim))
+  foldFits[paste0("fold", i)] <- list(tmp)
+  i <- i + 1
+}
+
+accuracies <- list()
+i <- 1
+#saving the accuracies
+for(fold in foldFits){
+  accuracies[[i]] <- fold$results$Accuracy
+  i <- i + 1
+}
+
+means <- c()
+tmp <- 0
+#calculating the mean for the accuracies
+for(i in 1:kLim){
+  for (acc in accuracies){
+    tmp <- tmp + acc[i]
+  }
+  tmp <- tmp / nfolds
+  means <- c(means, tmp)
+  tmp <- 0
+}
+highest <- c(0,1)
+#finding the best k
+for(n in 1:kLim){
+  if (means[n] > highest[1]){
+    highest[1] = means[n]
+    highest[2] = n
+  }
+}
+plot(means)
+print(paste("The best k is: ", highest[2]))
+```
+
+We can also visualize the confusion matrix for the predictions. In this case, we fit the model (with the best k) using tidyverse and tidymodels:
+```{r}
+knn_spec <- nearest_neighbor(neighbors=highest[2]) %>% 
+    set_mode("classification") %>% 
+    set_engine("kknn")
+
+knn_fit <- knn_spec %>% 
+    fit(breast ~ ., data = train_data)
+
+augmented_ts <- augment(knn_fit, new_data=test_data)
+
+augmented_ts %>% 
+    conf_mat(truth=breast, estimate=.pred_class)
+```
+
+And the accuracy:
+```{r}
+(accKnn <- augmented_ts %>% 
+    accuracy(truth=breast, estimate=.pred_class))
+```
+
+The accuracy here is ~77.8%, like the GLM model. Now we fit our last model, the Naïve Bayes classifier, once again using caret's train function with cross validation. Then, we visualize the confusion matrix and the accuracy:
+```{r}
+fitNaive <- train(breast ~ .,
+                  data = train_data,
+                  method = "naive_bayes",
+                  trControl = ctrl)
+predNaive <- predict(fitNaive, test_data, type = "prob")
+predFinal <- ifelse(predNaive[,2] >= 0.5, "Breast", "Bottle")
+
+table(predFinal, test_data$breast)
+(accNaive <- mean(predFinal == test_data$breast))
+```
+
+The Naïve Bayes classifier has an accuracy of ~77.8%, same as the previous models. We now compare the precision/specificity of all the models:
+```{r}
+specGlm <- specificity(table(glm.pred, test_data$breast))
+specKnn <- specificity(table(augmented_ts$.pred_class, test_data$breast))
+specNaive <- specificity(table(predFinal,test_data$breast))
+
+(dfSpec <- data.frame(Model = c("GLM", "KNN", "NAIVE"),
+                 Specificity = c(specGlm, specKnn, specNaive)))
+```
+
+Here, the GLM model scores the lowest, while the k-nn has the highest score. Let's visualize all the scores, together with the sensitivity:
+```{r}
+sensGlm <- sensitivity(table(glm.pred, test_data$breast))
+sensKnn <- sensitivity(table(augmented_ts$.pred_class, test_data$breast))
+sensNaive <- sensitivity(table(predFinal,test_data$breast))
+
+dfFinal <- data.frame(GLM = c(accGlm, specGlm, sensGlm),  KNN = c(accKnn$.estimate, specKnn, sensKnn), NAIVE = c(accNaive, specNaive, sensNaive))
+rownames(dfFinal) <- c("Accuracy","Specificity", "Sensitivity")
+dfFinal
+```
+
+
+Finally, we plot the ROC curve for all the models and compare them visually. For this, we will use pROC's "roc" function. In the plot, we also visualize the AUC score. The AUC score, which stands for "Area Under Curve", is yet another measure to help us determine how well a model classifies data. Therefore, for the scope of this analysis, we can use it to decide which model is the best:
+```{r}
+glmRoc = roc(test_data$breast ~ glm.probs[,2])
+plot.roc(glmRoc, print.auc = TRUE, col = "red", print.auc.y = 0.6)
+
+knnRoc = roc(test_data$breast ~ augmented_ts$.pred_Breast)
+plot.roc(knnRoc, add = TRUE, print.auc = TRUE, col="green")
+
+bayRoc = roc(test_data$breast ~ predNaive[,2])
+plot.roc(bayRoc, add = TRUE, print.auc = TRUE, col="blue", print.auc.y = 0.4)
+
+par(cex = 0.9)
+legend("bottomright", legend=c("GLM", "k-nn", "Naïve Bayes"), col=c("red", "green", "blue"),
+       lty=c(1, 1, 1))
+```
+
+From the ROC curves, we can see that the Naïve Bayes is the one with the better AUC score, the GLM is right behind it with only 0.07 points of difference and the k-nn model performs the worst but, once again, not by much. Overall, all the models seem very close.
+
+To recap:
+
+- the accuracy is the same for all models
+
+- the k-nn model has the best specificity
+
+- the GLM model has the best sensitivity
+
+- the Naïve Bayes model has the better AUC score in the ROCR curve analysis, but the GLM seems very close
+
+In the end, the GLM seems the better one, especially since the AUC is very close to the Naïve Bayes but the sensitivity is much better.
